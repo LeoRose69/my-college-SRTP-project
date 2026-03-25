@@ -1,4 +1,5 @@
 #first attempt(chessboard pnp)
+'''which was an absolute failure'''
 
 import cv2
 import numpy as np

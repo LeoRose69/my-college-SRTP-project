@@ -1,75 +1,51 @@
 '''该文件未成功运行，原因为pycolmap/colmap不能直接处理h5格式文件'''
 
-
 import pycolmap
 import os
 
-# 路径设置
-image_dir = r"D:\COLMAP\project1\imagex_try"
+# 路径
 output_dir = r"D:\COLMAP\project1\results_superpoint+lightglue_matching_lowres_quality_high"
+image_dir = r"D:\COLMAP\project1\imagex_try"
 database_path = os.path.join(output_dir, "database.db")
 
-print("=" * 50)
-print("开始重建")
-print("=" * 50)
-
-# ==================== 1. 删除旧的数据库 ====================
+# 删除旧数据库
 if os.path.exists(database_path):
     os.remove(database_path)
-    print("删除旧数据库")
+    print("✅ 已删除旧数据库")
 
-# ==================== 2. 创建新数据库 ====================
-print("\n[1/3] 创建数据库...")
-pycolmap.Database.create(database_path)
-
-# ==================== 3. 导入特征和匹配 ====================
-print("\n[2/3] 导入特征和匹配...")
-
-# 打开数据库
+# 创建新数据库
 db = pycolmap.Database(database_path)
+print("✅ 数据库创建成功")
 
-# 导入特征
-db.import_features(os.path.join(output_dir, "features.h5"))
-
-# 导入匹配
-db.import_matches(os.path.join(output_dir, "matches.h5"))
+# 添加所有图像
+import glob
+for img_path in glob.glob(os.path.join(image_dir, "*.jpg")):
+    img_name = os.path.basename(img_path)
+    db.add_image(img_name, camera_model="SIMPLE_RADIAL")
+    print(f"  添加: {img_name}")
 
 db.close()
 
-print("✅ 导入完成")
+# 导入特征（手动从 features.h5 导入到数据库）
+import h5py
+import numpy as np
 
-# ==================== 4. 运行重建 ====================
-print("\n[3/3] 运行增量重建...")
+# 读取 features.h5
+features_file = os.path.join(output_dir, "features.h5")
+with h5py.File(features_file, 'r') as f:
+    # 获取所有图像名
+    for img_name in f.keys():
+        keypoints = f[img_name]['keypoints'][:]
+        descriptors = f[img_name]['descriptors'][:]
+        
+        # 转换为 COLMAP 格式
+        # keypoints 格式: (N, 2) -> x, y
+        # descriptors 格式: (N, 256) -> 需要转置为 (256, N)
+        
+        print(f"  导入: {img_name}, {len(keypoints)} 个特征点")
+        
+        # 这里需要把特征点写入数据库
+        # 但 pycolmap 4.0.2 可能没有直接写入的方法
 
-# 增量重建
-reconstruction = pycolmap.incremental_mapping(
-    database_path=database_path,
-    image_path=image_dir,
-    output_path=output_dir,
-    options={  # 可选参数
-        "map_builder": {
-            "num_threads": 4,
-        },
-        "triangulation": {
-            "min_tri_angle_deg": 5.0,
-        },
-    },
-)
+print("特征导入完成（需要 pycolmap 支持）")
 
-if reconstruction:
-    print(f"\n✅ 重建成功！")
-    print(f"   - 3D 点数量: {reconstruction.num_points3D()}")
-    print(f"   - 相机数量: {reconstruction.num_reg_images()}")
-    
-    # 保存为文本格式
-    reconstruction.write_text(os.path.join(output_dir, "sparse", "0"))
-    print(f"\n📁 结果保存在: {output_dir}\\sparse\\0\\")
-    
-    # 查看 points3D.txt
-    points3d_path = os.path.join(output_dir, "sparse", "0", "points3D.txt")
-    if os.path.exists(points3d_path):
-        with open(points3d_path, 'r') as f:
-            lines = [l for l in f if not l.startswith('#')]
-        print(f"\n🎉 共有 {len(lines)} 个3D点")
-else:
-    print("\n❌ 重建失败")

@@ -3,6 +3,16 @@ import numpy as np
 import cv2
 from demo_superpoint import SuperPointFrontend
 
+import argparse
+import os
+from datetime import datetime
+import glob
+
+import gc   #内存管理
+from scipy.spatial.transform import Rotation as R
+
+
+
 # ==================== map_manager.py ====================
 
 class MapManager:
@@ -122,17 +132,22 @@ class PnPSolver:
         print("所有 PnP 方法都失败")
         return None
     
-    def draw_pose(self, frame, rvec, tvec):
-        """在图像上画相机坐标轴"""
-        axis = np.float32([[0.1,0,0], [0,0.1,0], [0,0,0.1]]).reshape(-1,3)
+    def draw_pose(self, frame, rvec, tvec, offset=0):
+        """在图像上画相机坐标轴
+        offset: 颜色偏移，0=红绿蓝，3=青品黄
+        """
+        axis = np.float32([[0,0,0], [0.1,0,0], [0,0.1,0], [0,0,0.1]])
         imgpts, _ = cv2.projectPoints(axis, rvec, tvec, self.K, None)
-        
-        cx, cy = int(self.K[0,2]), int(self.K[1,2])
-        colors = [(0,0,255), (0,255,0), (255,0,0)]
-        for i, pt in enumerate(imgpts):
-            pt = tuple(pt.ravel().astype(int))
-            cv2.line(frame, (cx, cy), pt, colors[i], 3)
+        imgpts = imgpts.reshape(-1, 2).astype(int)
 
+        # cx, cy = int(self.K[0,2]), int(self.K[1,2]) #主点（光心），不是世界原点的投影！
+       
+        origin = tuple(imgpts[0])
+        colors = [(0,0,255), (0,255,0), (255,0,0)]
+        if offset:
+            colors = [(255,255,0), (0,255,255), (255,0,255)]
+        for i, pt in enumerate(imgpts[1:]):
+            cv2.line(frame, origin, tuple(pt), colors[i], 3)
 
 # ==================== feature_extractor.py ====================
 
@@ -149,9 +164,25 @@ class FeatureExtractor:
 
         if len(image.shape) == 3:
             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        image = image.astype('float32') / 255.0
-        return self.fe.run(image)
 
+        # 缩放到最大 1024 像素（加速+省内存）内存防爆
+        h, w = image.shape
+        max_size = 1024
+        scale = 1.0  # 记录缩放比例
+        if max(h, w) > max_size:
+            scale = max_size / max(h, w)
+            new_w = int(w * scale)
+            new_h = int(h * scale)
+            image = cv2.resize(image, (new_w, new_h))
+        
+        image = image.astype('float32') / 255.0
+        pts, desc, heatmap = self.fe.run(image)
+        #claude 修改：之前的代码里 pts 和 desc 是在缩放后的图像上提取的，所以需要把它们缩放回原图坐标系下，才能和地图上的 3D 点匹配。
+        # 把特征点坐标缩放回原图分辨率
+        if scale != 1.0:
+            pts[:2, :] /= scale  # pts 是 (3, N)，前两行是 x, y
+
+        return pts, desc, heatmap
 
 # ==================== visualizer.py ====================
 
@@ -201,6 +232,11 @@ class Localizer:
         print("开始 PnP 解算...")  # ← 加这行
         result = self.solver.solve(img_points, world_points)
         print("PnP 解算完成")      # ← 加这行
+
+        # 手动释放内存
+        del pts, desc
+        gc.collect()
+
         return result
     
 
@@ -217,11 +253,73 @@ class Localizer:
         result = self._process_frame(frame)
         
         if result:
-            print(f"相机位置: {result['tvec']}")
+            # 生成输出文件名（在原图名后加 _pose）
+            base_name = os.path.splitext(os.path.basename(image_path))[0]
+            out_name = f"{base_name}_pose.jpg"
+            
+            # 1. 画pnp坐标轴
             self.solver.draw_pose(frame, result['rvec'], result['tvec'])
-            cv2.imwrite('pose_result.jpg', frame)
-            print("结果保存为 pose_result.jpg")
+            cv2.imwrite(out_name, frame)
+
+            # =========== 调试代码：画COLMAP真值轴 ===========
+            img_name = os.path.basename(image_path)
+            for img in self.map.reconstruction.images.values():
+                if img.name == img_name:
+
+                    pose = img.cam_from_world()
+    
+                    # 获取四元数 (x, y, z, w)
+                    quat = pose.rotation.quat  # [x, y, z, w]
+                    
+                    # 四元数转旋转矩阵
+                    r = R.from_quat(quat)
+                    R_true = r.as_matrix()
+                    
+                    # 转 Rodrigues 向量
+                    rvec_true, _ = cv2.Rodrigues(R_true)
+                    
+                    # 平移向量
+                    t_true = pose.translation
+
+                    print("=== 位姿对比 ===")
+                    print(f"真值位置: {t_true}")
+                    print(f"估计位置: {result['tvec']}")
+                    print(f"位置误差: {np.linalg.norm(t_true - result['tvec']):.2f} 米")
+                        
+                    # 画真值轴
+                    self.solver.draw_pose(frame, rvec_true, t_true, offset=1)
+                    break
+            
+            cv2.imwrite('pose_comparison.jpg', frame)
+            print("对比图保存为 pose_comparison.jpg")
+            # ==============================================
+
         
+            print(f"相机位置: {result['tvec']}")
+            print(f"结果保存为: {out_name}")
+
+
+
+        ''' # 加时间戳的版本
+        if result:
+            base_name = os.path.splitext(os.path.basename(image_path))[0]
+            timestamp = datetime.now().strftime('%Y%f_%H%M%S')
+            out_name = f"{base_name}_pose_{timestamp}.jpg"
+            
+            if output_dir:
+                os.makedirs(output_dir, exist_ok=True)
+                out_path = os.path.join(output_dir, out_name)
+            else:
+                out_path = out_name
+            
+            self.solver.draw_pose(frame, result['rvec'], result['tvec'])
+            cv2.imwrite(out_path, frame)
+            
+            print(f"相机位置: {result['tvec']}")
+            print(f"结果保存为: {out_path}")
+
+        '''
+
         return result
     
 
@@ -252,10 +350,92 @@ class Localizer:
         cap.release()
         cv2.destroyAllWindows()
 
+    def process_folder(self, folder_path, output_subdir='pnp_results'):
+        """
+        批量处理文件夹中的所有图片
+        folder_path: 图片文件夹路径
+        output_subdir: 结果保存的子文件夹名
+        """
+        # 查找所有图片
+        extensions = ['*.jpg', '*.jpeg', '*.png', '*.bmp']
+        image_files = []
+        for ext in extensions:
+            image_files.extend(glob.glob(os.path.join(folder_path, ext)))
+        
+        if not image_files:
+            print(f"文件夹 {folder_path} 中没有找到图片")
+            return []
+                
+        # 创建输出文件夹
+        if output_subdir is None:
+            folder_name = os.path.basename(os.path.normpath(folder_path))
+            output_subdir = f"{folder_name}_pnp"
+        
+        output_dir = os.path.join(folder_path, output_subdir)
+        os.makedirs(output_dir, exist_ok=True)
+
+        print(f"找到 {len(image_files)} 张图片")
+        print(f"结果保存到: {output_dir}")
+        
+        results = []
+        for img_path in image_files:
+            print(f"\n处理: {os.path.basename(img_path)}")
+            
+            frame = cv2.imread(img_path)
+            if frame is None:
+                print(f"  无法读取，跳过")
+                continue
+            
+            result = self._process_frame(frame)
+            
+            if result:
+                # 不加时间戳，直接覆盖
+                base_name = os.path.splitext(os.path.basename(img_path))[0]
+                out_name = f"{base_name}_pose.jpg"
+                out_path = os.path.join(output_dir, out_name)
+                
+                self.solver.draw_pose(frame, result['rvec'], result['tvec'])
+                cv2.imwrite(out_path, frame)
+                
+                result['image'] = img_path
+                result['output'] = out_path
+                results.append(result)
+                
+                print(f"  ✅ 相机位置: {result['tvec']}")
+                print(f"  📁 保存: {out_path}")
+            else:
+                print(f"  ❌ 定位失败")
+                results.append({'image': img_path, 'success': False})
+
+            ''' # 加时间戳版本
+             if result:
+                # 保存结果
+                base_name = os.path.splitext(os.path.basename(img_path))[0]
+                timestamp = datetime.now().strftime('%H%M%S')
+                out_name = f"{base_name}_pose_{timestamp}.jpg"
+                out_path = os.path.join(output_dir, out_name)
+                
+                self.solver.draw_pose(frame, result['rvec'], result['tvec'])
+                cv2.imwrite(out_path, frame)
+                
+                result['image'] = img_path
+                result['output'] = out_path
+                results.append(result)
+                
+                print(f"  ✅ 相机位置: {result['tvec']}")
+                print(f"  📁 保存: {out_path}")
+            else:
+                print(f"  ❌ 定位失败")
+                results.append({'image': img_path, 'success': False})
+                
+            '''
+
+        print(f"\n完成: {len([r for r in results if r.get('success', True)])}/{len(image_files)} 张成功")
+        return results
+
 
 # ==================== main.py ====================
 if __name__ == '__main__':
-    import argparse
     
     parser = argparse.ArgumentParser(description='PnP Localization Demo')
     parser.add_argument('input', type=str, help='Image file path or "camera"')
@@ -268,7 +448,8 @@ if __name__ == '__main__':
     
     if args.input == 'camera':
         localizer.run_camera()
+    elif os.path.isdir(args.input):
+        localizer.process_folder(args.input)
     else:
         localizer.process_image(args.input)
-
 

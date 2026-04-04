@@ -5,7 +5,7 @@ from demo_superpoint import SuperPointFrontend
 
 import argparse
 import os
-from datetime import datetime
+#from datetime import datetime
 import glob
 
 import gc   #内存管理
@@ -58,6 +58,8 @@ class MapManager:
             best_sim = -1
             best_pid = None
             
+            # 暴力匹配，复杂度O(n*m)，n是图像特征点数量，m是地图3D点数量。对于小规模地图和实时性要求不高的场景，这种方法是可行的。
+            # 如果地图点数量非常大，可以考虑使用 KD 树或其他近似最近邻算法来加速匹配。
             for pid, pdesc in self.point3d_to_desc.items():
                 sim = np.dot(query_desc, pdesc)
                 if sim > best_sim:
@@ -94,6 +96,7 @@ class PnPSolver:
         # ==========================================
 
         # 1. 先用 RANSAC 尝试
+        # RANSAC 1000 次迭代(效率低下)，重投影误差阈值 10 像素，置信度 95%
         success, rvec, tvec, inliers = cv2.solvePnPRansac(
             world_points, img_points, self.K, None,
             iterationsCount=1000,
@@ -132,11 +135,12 @@ class PnPSolver:
         print("所有 PnP 方法都失败")
         return None
     
-    def draw_pose(self, frame, rvec, tvec, offset=0):
+    def draw_pose(self, frame, rvec, tvec, offset=0, axis_length=0.4):
         """在图像上画相机坐标轴
         offset: 颜色偏移，0=红绿蓝，3=青品黄
+        axis_length: 轴的长度（米），默认 0.1，改大可使轴更明显
         """
-        axis = np.float32([[0,0,0], [0.1,0,0], [0,0.1,0], [0,0,0.1]])
+        axis = np.float32([[0,0,0], [axis_length,0,0], [0,axis_length,0], [0,0,axis_length]])
         imgpts, _ = cv2.projectPoints(axis, rvec, tvec, self.K, None)
         imgpts = imgpts.reshape(-1, 2).astype(int)
 

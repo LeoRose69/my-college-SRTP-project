@@ -10,6 +10,7 @@ import glob
 
 import gc   #内存管理
 from scipy.spatial.transform import Rotation as R
+from annoy import AnnoyIndex
 
 
 
@@ -17,19 +18,29 @@ from scipy.spatial.transform import Rotation as R
 
 class MapManager:
     """管理 3D 地图"""
-    
+
     def __init__(self, map_path, desc_path):
         self.reconstruction = pycolmap.Reconstruction()
         self.reconstruction.read_binary(map_path)
-        
+
         # 3D 点坐标
         self.point3d_coords = {}
         for pid, p3d in self.reconstruction.points3D.items():
             self.point3d_coords[pid] = p3d.xyz
-        
-        # 描述子映射
+
+        # 描述子映射 + Annoy 索引
         self.point3d_to_desc = np.load(desc_path, allow_pickle=True).item()
-        
+
+        # 建立 Annoy 索引（加速特征匹配）
+        print("建立 Annoy 索引...")
+        self.annoy_index = AnnoyIndex(256, metric='angular')  # 256维，余弦相似度
+        self.pid_to_idx = {}  # 映射：Annoy索引 -> 3D点ID
+        for idx, (pid, pdesc) in enumerate(self.point3d_to_desc.items()):
+            self.annoy_index.add_item(idx, pdesc)
+            self.pid_to_idx[idx] = pid
+        self.annoy_index.build(30)  # 30棵树，平衡精度和速度
+        print(f"✅ Annoy 索引建立完成（30棵树）")
+
         # 相机内参
         cam = next(iter(self.reconstruction.cameras.values()))
         fx = cam.params[0]
@@ -38,38 +49,51 @@ class MapManager:
         self.K = np.array([[fx, 0, cx],
                           [0, fx, cy],
                           [0, 0, 1]], dtype=np.float32)
-        
+
         print(f"相机内参: fx={fx}, cx={cx}, cy={cy}")
         print(f"地图加载完成: {len(self.point3d_to_desc)} 个带描述子的 3D 点")
     
     def get_camera_intrinsics(self):
         return self.K
     
-    def match_3d_points(self, pts, desc):  # ← 加上 pts
-        """匹配 3D 点
+    def match_3d_points(self, pts, desc):
+        """匹配 3D 点（用 Annoy 加速 + Lowe's ratio test 过滤歧义匹配）
         pts: (3, N) 特征点坐标
         desc: (256, N) 描述子
         """
         img_points = []
         world_points = []
-        
+
         for i in range(desc.shape[1]):
             query_desc = desc[:, i]
+
+            # 用 Annoy 找最近的 2 个 3D 点候选，计算 Lowe's ratio test
+            nearest_indices = self.annoy_index.get_nns_by_vector(query_desc, n=2)
+
+            if len(nearest_indices) < 2:
+                continue
+
             best_sim = -1
+            second_best_sim = -1
             best_pid = None
-            
-            # 暴力匹配，复杂度O(n*m)，n是图像特征点数量，m是地图3D点数量。对于小规模地图和实时性要求不高的场景，这种方法是可行的。
-            # 如果地图点数量非常大，可以考虑使用 KD 树或其他近似最近邻算法来加速匹配。
-            for pid, pdesc in self.point3d_to_desc.items():
+
+            # 对候选重新计算点积
+            for idx in nearest_indices:
+                pid = self.pid_to_idx[idx]
+                pdesc = self.point3d_to_desc[pid]
                 sim = np.dot(query_desc, pdesc)
+
                 if sim > best_sim:
+                    second_best_sim = best_sim
                     best_sim = sim
                     best_pid = pid
-            
-            if best_sim > 0.7:
-                img_points.append([pts[0, i], pts[1, i]])  # ← 现在 pts 有定义了
+
+            # Lowe's ratio test: 最佳与次佳比值要足够大（>1.5），说明最佳明确优于次佳
+            # 同时最佳相似度也要足够高（>0.65）
+            if best_sim > 0.65 and (second_best_sim < 1e-6 or best_sim / second_best_sim > 1.5):
+                img_points.append([pts[0, i], pts[1, i]])
                 world_points.append(self.point3d_coords[best_pid])
-        
+
         return np.array(img_points, dtype=np.float32), np.array(world_points, dtype=np.float32)
 
 # ==================== pnp_solver.py ====================
@@ -96,12 +120,12 @@ class PnPSolver:
         # ==========================================
 
         # 1. 先用 RANSAC 尝试
-        # RANSAC 1000 次迭代(效率低下)，重投影误差阈值 10 像素，置信度 95%
+        # 匹配质量提升后，可以用更严格的参数
         success, rvec, tvec, inliers = cv2.solvePnPRansac(
             world_points, img_points, self.K, None,
-            iterationsCount=1000,
-            reprojectionError=10.0,
-            confidence=0.95
+            iterationsCount=2000,
+            reprojectionError=15.0,
+            confidence=0.9
         )
         
         if success:
@@ -304,26 +328,6 @@ class Localizer:
 
 
 
-        ''' # 加时间戳的版本
-        if result:
-            base_name = os.path.splitext(os.path.basename(image_path))[0]
-            timestamp = datetime.now().strftime('%Y%f_%H%M%S')
-            out_name = f"{base_name}_pose_{timestamp}.jpg"
-            
-            if output_dir:
-                os.makedirs(output_dir, exist_ok=True)
-                out_path = os.path.join(output_dir, out_name)
-            else:
-                out_path = out_name
-            
-            self.solver.draw_pose(frame, result['rvec'], result['tvec'])
-            cv2.imwrite(out_path, frame)
-            
-            print(f"相机位置: {result['tvec']}")
-            print(f"结果保存为: {out_path}")
-
-        '''
-
         return result
     
 
@@ -411,29 +415,7 @@ class Localizer:
                 print(f"  ❌ 定位失败")
                 results.append({'image': img_path, 'success': False})
 
-            ''' # 加时间戳版本
-             if result:
-                # 保存结果
-                base_name = os.path.splitext(os.path.basename(img_path))[0]
-                timestamp = datetime.now().strftime('%H%M%S')
-                out_name = f"{base_name}_pose_{timestamp}.jpg"
-                out_path = os.path.join(output_dir, out_name)
-                
-                self.solver.draw_pose(frame, result['rvec'], result['tvec'])
-                cv2.imwrite(out_path, frame)
-                
-                result['image'] = img_path
-                result['output'] = out_path
-                results.append(result)
-                
-                print(f"  ✅ 相机位置: {result['tvec']}")
-                print(f"  📁 保存: {out_path}")
-            else:
-                print(f"  ❌ 定位失败")
-                results.append({'image': img_path, 'success': False})
-                
-            '''
-
+            
         print(f"\n完成: {len([r for r in results if r.get('success', True)])}/{len(image_files)} 张成功")
         return results
 

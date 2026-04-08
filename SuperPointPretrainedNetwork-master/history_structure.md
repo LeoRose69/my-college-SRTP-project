@@ -111,7 +111,7 @@ COLMAP在特征提取和匹配的时候使用的是SIFT算法暴力解算，在�
    - 减少 PnP RANSAC 迭代次数
 
    ```python
-   >iterationsCount=500,  # 改小一半
-   >reprojectionError=15.0,  # 允许更大误差
+   iterationsCount=500,  # 改小一半
+   reprojectionError=15.0,  # 允许更大误差
    ```
    - 目标：10+ FPS

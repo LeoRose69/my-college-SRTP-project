@@ -45,39 +45,43 @@ from hloc import extract_features, match_features, reconstruction
    
 # ==================== 入口保护 ====================
 if __name__ == "__main__":
-    image_dir = Path(r"D:\COLMAP\project1\imagex_try")
-    output_dir = Path(r"D:\COLMAP\project1\hloc_output")
-    output_dir.mkdir(parents=True, exist_ok=True)
 
-    print("=" * 50)
+    image_dir = Path(r"D:\COLMAP\project1\imagex_try") #图片文件夹
+    output_dir = Path(r"D:\COLMAP\project1\hloc_output") #中间文件和最终地图放在哪里
+    output_dir.mkdir(parents=True, exist_ok=True) #确保输出目录存在，如果不存在就创建它
+
+    print("=" * 50) 
     print("HLOC 3D 重建")
     print("=" * 50)
 
     # ========== 特征提取 ==========
     print("\n[1/3] 提取 SuperPoint 特征...")
-    feature_conf = extract_features.confs["superpoint_aachen"]
+    feature_conf = extract_features.confs["superpoint_aachen"] #进行特征提取使用的配置菜单，适配superpoint的参数
     features_path = extract_features.main(
         conf=feature_conf,
         image_dir=image_dir,
         export_dir=output_dir,
         as_half=False,
-    )
-    print(f"特征文件: {features_path}")
+    ) 
+    #features_path 是一个 h5 文件，里面包含了所有图像的特征点和描述子；
+    #返回路径：output_dir / "feats-superpoint-n4096-r1024.h5"
+    print(f"特征文件: {features_path}") 
 
     # ========== 生成 pairs.txt ==========
     print("\n[2/3] 生成配对文件...")
-    images = sorted([f.name for f in image_dir.glob("*.jpg")])
+    images = sorted([f.name for f in image_dir.glob("*.jpg")]) #images 是一个列表，包含了所有图片的文件名，按字母顺序排序
     pairs_file = output_dir / "pairs.txt"
-    with open(pairs_file, 'w') as f:
-        for i, img1 in enumerate(images):
+    with open(pairs_file, 'w') as f: #打开 pairs.txt 文件准备写入
+        for i, img1 in enumerate(images): #双层循环，生成所有图片的配对组合
             for img2 in images[i+1:]:
                 f.write(f"{img1} {img2}\n")
     print(f"生成 {len(images)*(len(images)-1)//2} 对匹配")
+    #告诉hloc的特征匹配器需要检查的组合
 
     # ========== 特征匹配 ==========
     print("\n[3/3] 用 LightGlue 匹配...")
     matcher_conf = match_features.confs["superpoint+lightglue"]
-    matches_path = match_features.main(
+    matches_path = match_features.main( #使用pair.txt和features.h5文件进行特征匹配，生成matches.h5文件至output_dir
         conf=matcher_conf,
         pairs=pairs_file,
         export_dir=output_dir,
@@ -87,23 +91,41 @@ if __name__ == "__main__":
 
     # ========== 重建 ==========
     print("\n[4/3] 3D 重建...")
-    model = reconstruction.main(
-        sfm_dir=output_dir / "reconstruction",
+    model = reconstruction.main( #调用 pycolmap，使用特征和匹配文件进行 SfM 重建，生成点云和相机位姿
+        sfm_dir=output_dir / "reconstruction", #输出结果存放路径
         image_dir=image_dir,
         pairs=pairs_file,
+        #使用特征和匹配的结果进行重建
         features=features_path,        # 这里也要用文件路径
         matches=matches_path,
+        #让程序自动猜测相机内参
         camera_mode="AUTO",
+        #把重建过程的日志打印出来
         verbose=True,
     )
 
-    points3d_path = output_dir / "reconstruction" / "0" / "points3D.txt"
+    #检查是否成功 - 基本是废的啦
+    points3d_path = output_dir / "reconstruction" / "points3D.bin"
     if points3d_path.exists():
         with open(points3d_path, 'r') as f:
             lines = [l for l in f if not l.startswith('#')]
         print(f"\n🎉 成功！共有 {len(lines)} 个3D点")
     else:
         print("\n⚠️  points3D.txt 还没生成")
+
+
+'''
+在 output_dir / "reconstruction" 目录下：
+(重要：)
+cameras.bin - 重建的相机内参
+images.bin - 重建的相机位姿
+points3D.bin - 重建的3D点云
+(不重要：)
+rigs.bin - COLMAP自动生成的刚体组信息(用的是普通单相机，所以是空的，但 COLMAP 默认总会吐这个文件)
+frames.bin - COLMAP自动生成的视频帧索引信息(可以忽略)
+colmap.LOG.xxx.34016 - COLMAP的后台运行日志
+
+'''
 
         
 
